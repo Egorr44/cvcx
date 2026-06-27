@@ -1,14 +1,9 @@
 """
-Formats Polymarket activity events into clean Telegram messages.
-
-Supported types: TRADE, REWARD, MAKER_REBATE, REDEEM, REFERRAL_REWARD,
-                 SPLIT, MERGE, CONVERSION
+Formats Polymarket activity events into Telegram messages.
 """
 
 from datetime import datetime, timezone
 from typing import Any, Dict
-
-# ── Labels & icons ────────────────────────────────────────────────────────────
 
 _ICON = {
     "TRADE":           "🔄",
@@ -32,10 +27,13 @@ _LABEL = {
     "REFERRAL_REWARD": "Referral Reward",
 }
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def shorten(addr: str) -> str:
+    """0x1234…abcd"""
+    return f"{addr[:6]}…{addr[-4:]}"
+
 
 def _esc(text: str) -> str:
-    """Escape Telegram Markdown special characters in user-supplied strings."""
     for ch in ("*", "_", "`", "[", "]"):
         text = text.replace(ch, f"\\{ch}")
     return text
@@ -45,39 +43,42 @@ def _fmt_ts(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%b %d, %Y  %H:%M UTC")
 
 
-# ── Main formatter ────────────────────────────────────────────────────────────
-
-def format_activity(a: Dict[str, Any]) -> str:
-    """Return a Markdown-formatted message for a single Polymarket activity."""
-    atype  = a.get("type", "UNKNOWN")
-    icon   = _ICON.get(atype,  "📌")
-    label  = _LABEL.get(atype, atype)
-    title  = _esc(a.get("title") or "Unknown Market")
+def format_activity(a: Dict[str, Any], wallet: str = "") -> str:
+    """
+    Return a Markdown-formatted Telegram message for one Polymarket activity.
+    Pass `wallet` so the user knows which of their wallets triggered this.
+    """
+    atype   = a.get("type", "UNKNOWN")
+    icon    = _ICON.get(atype, "📌")
+    label   = _LABEL.get(atype, atype)
+    title   = _esc(a.get("title") or "Unknown Market")
     outcome = a.get("outcome") or ""
-    ts     = a.get("timestamp", 0)
+    ts      = a.get("timestamp", 0)
 
-    lines = [
-        f"{icon} *{label}*",
-        f"📊 {title}",
-    ]
+    lines = [f"{icon} *{label}*"]
 
-    # ── Per-type fields ───────────────────────────────────────────────────
+    # Show which wallet if the user has multiple
+    if wallet:
+        lines.append(f"👛 `{shorten(wallet)}`")
+
+    lines.append(f"📊 {title}")
+
+    # ── Per-type details ──────────────────────────────────────────────────
     if atype == "TRADE":
-        side    = a.get("side", "")
-        price   = a.get("price")
-        size    = a.get("size")
-        usdc    = a.get("usdcSize")
+        side  = a.get("side", "")
+        price = a.get("price")
+        size  = a.get("size")
+        usdc  = a.get("usdcSize")
 
-        side_mark = "🟢 BUY" if side == "BUY" else "🔴 SELL"
+        side_mark   = "🟢 BUY" if side == "BUY" else "🔴 SELL"
         outcome_txt = f"  ·  {outcome}" if outcome else ""
         lines.append(f"{side_mark}{outcome_txt}")
-
         if price is not None:
             lines.append(f"💲 Price: *${price:.3f}*")
         if size is not None:
             lines.append(f"📦 Shares: {size:.2f}")
         if usdc is not None:
-            lines.append(f"💵 USDC value: *${usdc:.2f}*")
+            lines.append(f"💵 USDC: *${usdc:.2f}*")
 
     elif atype in ("REWARD", "MAKER_REBATE", "REFERRAL_REWARD"):
         usdc = a.get("usdcSize")
@@ -94,18 +95,13 @@ def format_activity(a: Dict[str, Any]) -> str:
         if usdc is not None:
             lines.append(f"💵 Received: *${usdc:.2f} USDC*")
 
-    elif atype in ("SPLIT", "MERGE"):
+    elif atype in ("SPLIT", "MERGE", "CONVERSION"):
         usdc = a.get("usdcSize")
         size = a.get("size")
         if usdc is not None:
             lines.append(f"💵 USDC: ${usdc:.2f}")
         if size is not None:
             lines.append(f"📦 Tokens: {size:.2f}")
-
-    elif atype == "CONVERSION":
-        usdc = a.get("usdcSize")
-        if usdc is not None:
-            lines.append(f"💵 USDC: ${usdc:.2f}")
 
     # ── Footer ────────────────────────────────────────────────────────────
     lines.append(f"\n⏰ {_fmt_ts(ts)}")

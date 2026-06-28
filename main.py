@@ -1,11 +1,11 @@
 """
-Polymarket Activity Monitor — Telegram Bot  (v2: multi-wallet)
+Polymarket Activity Monitor — Telegram Bot  (v3: multi-wallet + labels)
 
-Each Telegram user can track up to MAX_WALLETS_PER_USER wallets.
-Just send any 0x… address to add it; use /remove to delete individual wallets.
+Each user can track up to MAX_WALLETS_PER_USER wallets, each with a custom name.
+Send any 0x… address to add it → bot asks for a name → wallet is saved.
 
-Required env var: BOT_TOKEN
-Optional env var: DB_PATH   (default: data/bot.db)
+Required env var : BOT_TOKEN
+Optional env var : DB_PATH  (default: data/bot.db)
 """
 
 import asyncio
@@ -26,7 +26,7 @@ from telegram.ext import (
 )
 
 from database import Database, MAX_WALLETS_PER_USER
-from notifications import format_activity, shorten
+from notifications import format_activity, shorten, esc
 from polymarket import PolymarketClient
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -37,7 +37,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-POLL_INTERVAL = 60
+POLL_INTERVAL = 60          # seconds between Polymarket checks
+MAX_LABEL_LEN = 32          # max characters for a wallet name
 _ETH_RE = re.compile(r"^0x[a-fA-F0-9]{40}$", re.I)
 
 # ── Tiny helpers ──────────────────────────────────────────────────────────────
@@ -51,23 +52,24 @@ def _client(ctx: ContextTypes.DEFAULT_TYPE) -> PolymarketClient:
 def _valid(addr: str) -> bool:
     return bool(_ETH_RE.match(addr.strip()))
 
+def _display(w: dict) -> str:
+    """Label if set, otherwise shortened address."""
+    return w.get("label") or shorten(w["wallet"])
+
 # ── /start ────────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    wallets = await _db(ctx).get_wallets(chat_id)
+    wallets = await _db(ctx).get_wallets(update.effective_chat.id)
 
     if wallets:
-        lines = ["👋 *Polymarket Activity Monitor*\n"]
-        lines.append(f"You're tracking *{len(wallets)}* wallet(s):\n")
+        lines = ["👋 *Polymarket Activity Monitor*\n",
+                 f"You're tracking *{len(wallets)}* wallet(s):\n"]
         for i, w in enumerate(wallets, 1):
-            lines.append(f"{i}. `{w['wallet']}`")
+            lines.append(f"{i}. 🏷 *{esc(w['label'] or '—')}*  `{shorten(w['wallet'])}`")
         lines.append(
             "\nSend any `0x…` address to *add* another wallet.\n\n"
-            "/wallets — see full list\n"
-            "/remove — remove a wallet\n"
-            "/stop — remove all wallets\n"
-            "/help — all commands"
+            "/wallets — full list  ·  /rename — rename\n"
+            "/remove — delete  ·  /stop — remove all  ·  /help — commands"
         )
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     else:
@@ -93,14 +95,54 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "🤖 *Polymarket Activity Monitor*\n\n"
         "*Commands:*\n"
         "/start — Welcome & wallet overview\n"
-        "/wallets — List all tracked wallets\n"
+        "/wallets — List all tracked wallets with names\n"
+        "/rename — Rename a wallet\n"
         "/remove — Remove a specific wallet\n"
-        "/stop — Remove ALL wallets (stop all monitoring)\n"
+        "/stop — Remove ALL wallets\n"
+        "/skip — Add current wallet without a name\n"
+        "/cancel — Cancel current action\n"
         "/help — This message\n\n"
-        "💡 *Tip:* Just send any `0x…` address to add it.\n"
-        "You can track up to *10 wallets* simultaneously.",
+        "💡 *Tip:* Just send any `0x…` address to add it — "
+        "the bot will ask you for a name.",
         parse_mode="Markdown",
     )
+
+# ── /cancel ───────────────────────────────────────────────────────────────────
+
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    had = bool(
+        ctx.user_data.pop("pending_wallet", None)
+        or ctx.user_data.pop("pending_rename", None)
+    )
+    await update.message.reply_text(
+        "Cancelled." if had else "Nothing to cancel.",
+    )
+
+# ── /skip — add pending wallet without a custom name ─────────────────────────
+
+async def cmd_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    wallet = ctx.user_data.pop("pending_wallet", None)
+    if not wallet:
+        await update.message.reply_text(
+            "Nothing pending. Send a wallet address first."
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    now_ts  = int(datetime.now(timezone.utc).timestamp())
+    label   = shorten(wallet)          # use short address as display name
+
+    result = await _db(ctx).add_wallet(chat_id, wallet, label, now_ts)
+    if result == "added":
+        all_w = await _db(ctx).get_wallets(chat_id)
+        await update.message.reply_text(
+            f"✅ *Wallet added!* ({len(all_w)}/{MAX_WALLETS_PER_USER} slots used)\n\n"
+            f"🏷 *{esc(label)}*\n`{wallet}`\n\n"
+            "_Send another address to add more, or /wallets to see all._",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text("Something went wrong. Please try again.")
 
 # ── /wallets ──────────────────────────────────────────────────────────────────
 
@@ -114,27 +156,62 @@ async def cmd_wallets(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    lines = [f"📋 *Tracking {len(wallets)} of {MAX_WALLETS_PER_USER} wallets:*\n"]
+    lines = [f"📋 *Tracking {len(wallets)} of {MAX_WALLETS_PER_USER} wallet(s):*\n"]
     for i, w in enumerate(wallets, 1):
-        lines.append(f"{i}. `{w['wallet']}`")
-    lines.append("\n/remove — remove a wallet\n/stop — remove all")
+        name = w.get("label") or "—"
+        lines.append(f"{i}. 🏷 *{esc(name)}*\n`{w['wallet']}`\n")
 
+    lines.append("/rename — rename  ·  /remove — delete  ·  /stop — remove all")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+# ── /rename ───────────────────────────────────────────────────────────────────
+
+async def cmd_rename(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    wallets = await _db(ctx).get_wallets(update.effective_chat.id)
+    if not wallets:
+        await update.message.reply_text("No wallets to rename. Use /start to add one.")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton(f"✏️  {_display(w)}", callback_data=f"ren:{w['wallet']}")]
+        for w in wallets
+    ]
+    keyboard.append([InlineKeyboardButton("— Cancel —", callback_data="ren:cancel")])
+
+    await update.message.reply_text(
+        "Which wallet do you want to rename?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+async def cb_rename(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "ren:cancel":
+        ctx.user_data.pop("pending_rename", None)
+        await query.edit_message_text("Cancelled.")
+        return
+
+    wallet = query.data[len("ren:"):]
+    ctx.user_data["pending_rename"] = wallet
+    ctx.user_data.pop("pending_wallet", None)
+
+    await query.edit_message_text(
+        f"Send a new name for this wallet:\n\n`{wallet}`\n\n"
+        "_(Or /cancel to abort)_",
+        parse_mode="Markdown",
+    )
 
 # ── /remove ───────────────────────────────────────────────────────────────────
 
 async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     wallets = await _db(ctx).get_wallets(update.effective_chat.id)
-
     if not wallets:
         await update.message.reply_text("Nothing to remove. Use /start to add a wallet.")
         return
 
     keyboard = [
-        [InlineKeyboardButton(
-            f"❌  {shorten(w['wallet'])}",
-            callback_data=f"rm:{w['wallet']}",
-        )]
+        [InlineKeyboardButton(f"❌  {_display(w)}", callback_data=f"rm:{w['wallet']}")]
         for w in wallets
     ]
     keyboard.append([InlineKeyboardButton("— Cancel —", callback_data="rm:cancel")])
@@ -144,29 +221,26 @@ async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
-async def handle_remove_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cb_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
 
-    data = query.data  # "rm:0x…" or "rm:cancel"
-    if data == "rm:cancel":
+    if query.data == "rm:cancel":
         await query.edit_message_text("Cancelled.")
         return
 
-    wallet  = data[len("rm:"):]
+    wallet  = query.data[len("rm:"):]
     chat_id = query.message.chat_id
     removed = await _db(ctx).remove_wallet(chat_id, wallet)
 
     if removed:
         remaining = await _db(ctx).get_wallets(chat_id)
-        count_txt = (
-            f"Still tracking *{len(remaining)}* wallet(s)."
-            if remaining
+        footer = (
+            f"Still tracking *{len(remaining)}* wallet(s)." if remaining
             else "No wallets left. Use /start to add one."
         )
         await query.edit_message_text(
-            f"✅ Removed: `{wallet}`\n\n{count_txt}",
-            parse_mode="Markdown",
+            f"✅ Removed: `{wallet}`\n\n{footer}", parse_mode="Markdown"
         )
     else:
         await query.edit_message_text("Wallet not found (already removed?).")
@@ -176,74 +250,101 @@ async def handle_remove_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     wallets = await _db(ctx).get_wallets(chat_id)
-
     if not wallets:
         await update.message.reply_text("Nothing to stop. Use /start to begin.")
         return
 
     await _db(ctx).remove_all_wallets(chat_id)
     await update.message.reply_text(
-        f"⏹ *Stopped monitoring {len(wallets)} wallet(s).*\n\n"
-        "Use /start anytime to resume.",
+        f"⏹ *Stopped monitoring {len(wallets)} wallet(s).*\n\nUse /start anytime to resume.",
         parse_mode="Markdown",
     )
 
-# ── Text handler: add wallet when user sends 0x… ─────────────────────────────
+# ── Text handler: wallet address OR name/rename input ────────────────────────
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    raw = update.message.text.strip()
-    if not _valid(raw):
-        # Not a wallet address — ignore silently
-        # (avoids spamming error messages on normal conversation)
-        return
-
-    wallet  = raw.lower()
+    raw     = update.message.text.strip()
     chat_id = update.effective_chat.id
-    now_ts  = int(datetime.now(timezone.utc).timestamp())
 
-    result = await _db(ctx).add_wallet(chat_id, wallet, now_ts)
+    # ── 1. Waiting for a name for a newly submitted wallet ────────────────
+    if ctx.user_data.get("pending_wallet") and not _valid(raw):
+        wallet = ctx.user_data.pop("pending_wallet")
+        label  = raw[:MAX_LABEL_LEN].strip()
+        now_ts = int(datetime.now(timezone.utc).timestamp())
 
-    if result == "exists":
+        result = await _db(ctx).add_wallet(chat_id, wallet, label, now_ts)
+        if result == "added":
+            has_hist = await _client(ctx).has_history(wallet)
+            note = (
+                ""
+                if has_hist
+                else "\n\n⚠️ No prior activity found — I'll alert you on the first event."
+            )
+            all_w = await _db(ctx).get_wallets(chat_id)
+            await update.message.reply_text(
+                f"✅ *Wallet added!* ({len(all_w)}/{MAX_WALLETS_PER_USER} slots used)\n\n"
+                f"🏷 *{esc(label)}*\n`{wallet}`{note}\n\n"
+                "_Send another address to add more, or /wallets to see all._",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(
+                "Something went wrong. Please send the wallet address again."
+            )
+        return
+
+    # ── 2. Waiting for a new name (rename flow) ───────────────────────────
+    if ctx.user_data.get("pending_rename") and not _valid(raw):
+        wallet = ctx.user_data.pop("pending_rename")
+        label  = raw[:MAX_LABEL_LEN].strip()
+        ok = await _db(ctx).update_label(chat_id, wallet, label)
+        if ok:
+            await update.message.reply_text(
+                f"✅ *Renamed!*\n\n🏷 *{esc(label)}*\n`{wallet}`",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text("Wallet not found.")
+        return
+
+    # ── 3. New wallet address ─────────────────────────────────────────────
+    if _valid(raw):
+        wallet = raw.lower()
+
+        # Clear any stale pending state
+        ctx.user_data.pop("pending_wallet", None)
+        ctx.user_data.pop("pending_rename", None)
+
+        current = await _db(ctx).get_wallets(chat_id)
+        if any(w["wallet"] == wallet for w in current):
+            await update.message.reply_text(
+                f"⚠️ Already tracking `{wallet}`\n\n/wallets to see all.",
+                parse_mode="Markdown",
+            )
+            return
+        if len(current) >= MAX_WALLETS_PER_USER:
+            await update.message.reply_text(
+                f"❌ You've reached the limit of *{MAX_WALLETS_PER_USER} wallets*.\n\n"
+                "Use /remove to free up a slot.",
+                parse_mode="Markdown",
+            )
+            return
+
+        ctx.user_data["pending_wallet"] = wallet
         await update.message.reply_text(
-            f"⚠️ Already monitoring `{wallet}`\n\n"
-            "Use /wallets to see all tracked wallets.",
+            f"Got it! Now give this wallet a name:\n\n`{wallet}`\n\n"
+            "_(Use /skip to add it without a name, or /cancel to abort)_",
             parse_mode="Markdown",
         )
         return
 
-    if result == "limit":
-        await update.message.reply_text(
-            f"❌ You've reached the limit of *{MAX_WALLETS_PER_USER} wallets*.\n\n"
-            "Use /remove to free up a slot.",
-            parse_mode="Markdown",
-        )
-        return
-
-    # result == "added"
-    has_hist = await _client(ctx).has_history(wallet)
-    note = (
-        ""
-        if has_hist
-        else "\n\n⚠️ No prior activity found — I'll alert you when the first event occurs."
-    )
-
-    all_wallets = await _db(ctx).get_wallets(chat_id)
-    count = len(all_wallets)
-    slot_txt = f"{count}/{MAX_WALLETS_PER_USER}"
-
-    await update.message.reply_text(
-        f"✅ *Wallet added!* ({slot_txt} slots used)\n\n"
-        f"`{wallet}`{note}\n\n"
-        "_Send another address to add more, or /wallets to see all._",
-        parse_mode="Markdown",
-    )
+    # ── 4. Unrecognised text with no pending state → ignore silently ──────
 
 # ── Background poll loop ──────────────────────────────────────────────────────
 
 async def poll_loop(app: Application) -> None:
     database: Database         = app.bot_data["db"]
     poly:     PolymarketClient = app.bot_data["client"]
-
     logger.info("Poll loop started (interval=%ds)", POLL_INTERVAL)
 
     while True:
@@ -254,6 +355,7 @@ async def poll_loop(app: Application) -> None:
             row_id    = row["id"]
             chat_id   = row["chat_id"]
             wallet    = row["wallet"]
+            label     = row.get("label") or shorten(wallet)   # fallback for unlabelled
             last_seen = row["last_seen"]
 
             try:
@@ -264,28 +366,22 @@ async def poll_loop(app: Application) -> None:
                 latest_ts = max(e["timestamp"] for e in events)
                 await database.update_last_seen(row_id, latest_ts)
 
-                # Count wallets for this user to decide whether to show wallet label
-                user_wallet_count = len(await database.get_wallets(chat_id))
-
                 for ev in events:
-                    # Only show wallet label if user tracks multiple wallets
-                    wallet_label = wallet if user_wallet_count > 1 else ""
                     try:
                         await app.bot.send_message(
                             chat_id=chat_id,
-                            text=format_activity(ev, wallet=wallet_label),
+                            text=format_activity(ev, wallet=wallet, label=label),
                             parse_mode="Markdown",
                             disable_web_page_preview=True,
                         )
                     except Forbidden:
-                        logger.warning("User %s blocked bot; removing all their wallets.", chat_id)
+                        logger.warning("User %s blocked bot; removing their wallets.", chat_id)
                         await database.remove_all_wallets(chat_id)
                         break
                     except BadRequest as exc:
                         logger.error("BadRequest to %s: %s", chat_id, exc)
                     except Exception as exc:
                         logger.error("Send error to %s: %s", chat_id, exc)
-
                     await asyncio.sleep(0.3)
 
             except asyncio.CancelledError:
@@ -306,7 +402,7 @@ async def post_init(app: Application) -> None:
         os.makedirs(db_dir, exist_ok=True)
 
     database = Database(db_path)
-    await database.init()        # also runs migration if needed
+    await database.init()
 
     app.bot_data["db"]        = database
     app.bot_data["client"]    = PolymarketClient()
@@ -315,15 +411,14 @@ async def post_init(app: Application) -> None:
 
 
 async def post_shutdown(app: Application) -> None:
-    task: asyncio.Task | None = app.bot_data.get("poll_task")
+    task = app.bot_data.get("poll_task")
     if task:
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
-
-    poly: PolymarketClient | None = app.bot_data.get("client")
+    poly = app.bot_data.get("client")
     if poly:
         await poly.close()
 
@@ -344,11 +439,14 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("wallets", cmd_wallets))
+    app.add_handler(CommandHandler("rename",  cmd_rename))
     app.add_handler(CommandHandler("remove",  cmd_remove))
     app.add_handler(CommandHandler("stop",    cmd_stop))
+    app.add_handler(CommandHandler("skip",    cmd_skip))
+    app.add_handler(CommandHandler("cancel",  cmd_cancel))
     app.add_handler(CommandHandler("help",    cmd_help))
-    app.add_handler(CallbackQueryHandler(handle_remove_callback, pattern=r"^rm:"))
-    # Catch all text messages that look like wallet addresses
+    app.add_handler(CallbackQueryHandler(cb_rename, pattern=r"^ren:"))
+    app.add_handler(CallbackQueryHandler(cb_remove, pattern=r"^rm:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Starting bot…")

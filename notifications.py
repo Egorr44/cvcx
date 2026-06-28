@@ -33,7 +33,8 @@ def shorten(addr: str) -> str:
     return f"{addr[:6]}…{addr[-4:]}"
 
 
-def _esc(text: str) -> str:
+def esc(text: str) -> str:
+    """Escape Telegram Markdown special characters in user-supplied strings."""
     for ch in ("*", "_", "`", "[", "]"):
         text = text.replace(ch, f"\\{ch}")
     return text
@@ -43,24 +44,31 @@ def _fmt_ts(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%b %d, %Y  %H:%M UTC")
 
 
-def format_activity(a: Dict[str, Any], wallet: str = "") -> str:
+def format_activity(a: Dict[str, Any], wallet: str = "", label: str = "") -> str:
     """
-    Return a Markdown-formatted Telegram message for one Polymarket activity.
-    Pass `wallet` so the user knows which of their wallets triggered this.
+    Return a Markdown-formatted Telegram message for one activity event.
+
+    First line is always the wallet identifier:
+      - label  → 👛 *My Wallet Name*
+      - no label → 👛 `0x1234…abcd`
     """
-    atype   = a.get("type", "UNKNOWN")
-    icon    = _ICON.get(atype, "📌")
-    label   = _LABEL.get(atype, atype)
-    title   = _esc(a.get("title") or "Unknown Market")
-    outcome = a.get("outcome") or ""
-    ts      = a.get("timestamp", 0)
+    atype    = a.get("type", "UNKNOWN")
+    icon     = _ICON.get(atype, "📌")
+    ev_label = _LABEL.get(atype, atype)
+    title    = esc(a.get("title") or "Unknown Market")
+    outcome  = a.get("outcome") or ""
+    ts       = a.get("timestamp", 0)
 
-    lines = [f"{icon} *{label}*"]
+    lines = []
 
-    # Show which wallet if the user has multiple
-    if wallet:
+    # ── First line: wallet name / address ─────────────────────────────────
+    if label:
+        lines.append(f"👛 *{esc(label)}*")
+    elif wallet:
         lines.append(f"👛 `{shorten(wallet)}`")
 
+    # ── Event type ────────────────────────────────────────────────────────
+    lines.append(f"{icon} *{ev_label}*")
     lines.append(f"📊 {title}")
 
     # ── Per-type details ──────────────────────────────────────────────────
